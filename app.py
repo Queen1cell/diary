@@ -1,381 +1,294 @@
-"""감성 다이어리 - Streamlit 진입점 (3단계: UI 디자인).
-
-기능 로직(AI 호출/DB 저장·조회/에러 처리 흐름)은 2단계와 동일하게 유지한다.
-이번 단계에서는 "따뜻한 느낌의 일기장" 컨셉으로 화면을 스타일링하고, 문구 톤을
-다듬는다. `.streamlit/config.toml`의 테마(색상/폰트/모서리 둥글기)와 이 파일의
-커스텀 CSS(카드형 컨테이너, 포스트잇 카드, 최근 기록 카드, 은은한 등장 애니메이션)
-를 함께 사용한다.
-"""
+# app.py — AI 공감 다이어리 (Streamlit)
+# 오늘 있었던 일을 한 줄로 쓰면, OpenAI(gpt-4o-mini)가 감정을 분석하고 공감·위로해 준다.
+# 원본 Node 프로토타입(node-prototype/src/openai.js)의 프롬프트/8범주/폴백 로직을 그대로 옮겼다.
+# API 키는 절대 코드/저장소에 두지 않고 st.secrets["OPENAI_API_KEY"] 또는 환경변수에서만 읽는다.
 
 import html
+import json
+import os
 from datetime import datetime
 
 import streamlit as st
 
-import ai_chain
-import db
+# 로컬 개발 편의: .env 가 있으면 로드(있을 때만). 배포(Streamlit Cloud)에서는 st.secrets 사용.
+try:
+    from dotenv import load_dotenv
 
-st.set_page_config(page_title="감성 다이어리", page_icon="📔", layout="centered")
+    load_dotenv()
+except Exception:
+    pass
 
-# 앱 시작 시 DB 스키마를 준비한다. (기능 로직 변경 없음)
-db.init_db()
+from openai import OpenAI
 
-_WEEKDAY_KO = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+# --------------------------------------------------------------------------
+# 상수 · 감정 정의 (PRD 6장 고정 8범주)
+# --------------------------------------------------------------------------
+MODEL = "gpt-4o-mini"
+REQUEST_TIMEOUT = 15  # 초
+
+EMOTIONS = ["기쁨", "설렘", "평온", "슬픔", "불안", "분노", "지침", "기타"]
+
+# 감정 → (이모지, 배경색, 글자색) — 밝은 배경 + 어두운 글자로 대비(WCAG AA) 확보
+EMOTION_STYLE = {
+    "기쁨": ("😊", "#fdf3c7", "#8a6d0b"),
+    "설렘": ("🥰", "#fbe1ea", "#a83b63"),
+    "평온": ("🙂", "#d9f2e6", "#2f7a5a"),
+    "슬픔": ("😢", "#dbe8fb", "#37588f"),
+    "불안": ("😟", "#e7e0f5", "#5a4a8a"),
+    "분노": ("😠", "#fbdcd7", "#a8402f"),
+    "지침": ("😮‍💨", "#e6e3df", "#5f574d"),
+    "기타": ("🌫️", "#eee9e1", "#6a635b"),
+}
+
+FALLBACK_EMPATHY = (
+    "지금 이 순간의 마음을 이렇게 적어주셔서 고마워요. "
+    "어떤 하루였든 당신의 감정은 소중합니다. 오늘도 충분히 잘 지내셨어요."
+)
+
+SYSTEM_PROMPT = """당신은 따뜻하고 공감 능력이 뛰어난 감정 코치입니다.
+사용자가 오늘 있었던 일을 한 줄로 적으면, 그 감정을 읽고 위로해 줍니다.
+
+반드시 지켜야 할 규칙:
+1. 대표 감정을 다음 8가지 중 정확히 하나로만 분류합니다: 기쁨, 설렘, 평온, 슬픔, 불안, 분노, 지침, 기타.
+   - 위 목록에 없는 단어나 변형은 절대 사용하지 마세요.
+2. 공감·위로 메시지(empathy)는 2~4문장의 한국어로 작성합니다.
+   - 판단하거나 훈계하지 말고, 사용자의 감정을 있는 그대로 인정하고 따뜻하게 다독여 주세요.
+   - 진부한 표현을 피하고 사용자의 구체적인 상황에 반응하세요.
+3. 반드시 아래 JSON 형식으로만 답하세요. 그 외의 텍스트, 설명, 마크다운은 절대 출력하지 마세요.
+
+출력 형식:
+{"emotion": "<8가지 중 하나>", "empathy": "<2~4문장의 공감 메시지>"}"""
 
 
-def _today_header_text() -> str:
-    now = datetime.now()
-    return f"{now.year}년 {now.month}월 {now.day}일 {_WEEKDAY_KO[now.weekday()]}"
+# --------------------------------------------------------------------------
+# API 키 · OpenAI 클라이언트
+# --------------------------------------------------------------------------
+def get_api_key():
+    """st.secrets → 환경변수 순으로 키를 찾는다. 키 값은 화면/로그에 노출하지 않는다."""
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            return st.secrets["OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("OPENAI_API_KEY")
 
 
-# ---------------------------------------------------------------------------
-# 커스텀 CSS: 종이 일기장을 펼친 듯한 카드 레이아웃 + 포스트잇 피드백 카드.
-# 색상 대비는 WCAG AA(4.5:1) 이상을 확인한 값만 사용한다.
-# ---------------------------------------------------------------------------
-_DIARY_CSS = """
+@st.cache_resource(show_spinner=False)
+def get_client(api_key: str):
+    return OpenAI(api_key=api_key, timeout=REQUEST_TIMEOUT)
+
+
+def parse_response(raw: str):
+    """모델 응답(JSON 문자열)을 파싱하고 감정 범주를 검증한다."""
+    data = json.loads(raw)
+    emotion = (data.get("emotion") or "").strip()
+    empathy = (data.get("empathy") or "").strip()
+    if not empathy:
+        raise ValueError("empathy 필드가 비어 있음")
+    if emotion not in EMOTIONS:
+        emotion = "기타"
+    return emotion, empathy
+
+
+def analyze_entry(content: str):
+    """한 줄 일기를 분석해 dict(emotion, empathy, fallback, notice)를 반환.
+    실패해도 예외를 던지지 않고 안전한 폴백을 돌려준다."""
+    api_key = get_api_key()
+    if not api_key:
+        return {
+            "emotion": "기타",
+            "empathy": FALLBACK_EMPATHY,
+            "fallback": True,
+            "notice": "OPENAI_API_KEY가 설정되지 않아 기본 위로 메시지를 보여드려요.",
+        }
+
+    client = get_client(api_key)
+    last_error = None
+    for attempt in range(2):  # 최초 + 재시도 1회
+        try:
+            completion = client.chat.completions.create(
+                model=MODEL,
+                temperature=0.8,
+                max_tokens=300,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": content},
+                ],
+            )
+            raw = completion.choices[0].message.content or ""
+            emotion, empathy = parse_response(raw)
+            return {"emotion": emotion, "empathy": empathy, "fallback": False}
+        except Exception as err:  # noqa: BLE001
+            last_error = err
+            status = getattr(err, "status_code", None) or getattr(err, "status", None)
+            if status in (401, 403):
+                break  # 키 무효/권한 없음: 재시도해도 소용없음
+
+    return {
+        "emotion": "기타",
+        "empathy": FALLBACK_EMPATHY,
+        "fallback": True,
+        "notice": "AI 응답을 불러오지 못해 기본 위로 메시지를 보여드려요. 잠시 후 다시 시도해 주세요.",
+    }
+
+
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
+st.set_page_config(page_title="AI 공감 다이어리", page_icon="🌿", layout="centered")
+
+CUSTOM_CSS = """
 <style>
-:root {
-  --diary-bg-app: #FAF3E8;
-  --diary-bg-card: #FFFDF7;
-  --diary-bg-postit: #FFF3D6;
-  --diary-bg-badge: #F6D9B8;
-  --diary-text-main: #4A3428;
-  --diary-text-sub: #75604F;
-  --diary-badge-text: #6E4A28;
-  --diary-accent: #F2A488;
-  --diary-accent-deep: #B5482E;
-  --diary-border: #E8C9A0;
+:root { --accent:#e0876b; --accent-strong:#cf6f52; --text:#3a352f; --muted:#9a9088; }
+.stApp {
+  background:
+    radial-gradient(1200px 600px at 15% -10%, #f7ede0 0%, transparent 55%),
+    radial-gradient(1000px 500px at 110% 10%, #f3eef6 0%, transparent 50%),
+    #fbf6ee;
 }
-
-/* 앱 전체 배경: 은은한 크림 톤의 "책상" 배경 */
-[data-testid="stAppViewContainer"] {
-  background: radial-gradient(circle at 50% 0%, #FFF8EC 0%, var(--diary-bg-app) 55%);
+.block-container { max-width: 680px; padding-top: 2.2rem; }
+.diary-title { font-size: 2rem; font-weight: 800; color: var(--text); margin: 0; letter-spacing: -.5px; }
+.diary-sub { color: var(--muted); margin: .3rem 0 1.4rem; font-size: .98rem; }
+.stTextArea textarea {
+  background: #fffdf9; border: 1px solid #ece3d6 !important; border-radius: 16px !important;
+  font-size: 1.02rem; color: var(--text); box-shadow: 0 6px 18px rgba(160,120,90,.06);
 }
-[data-testid="stHeader"] {
-  background: transparent;
+div.stButton > button {
+  background: var(--accent); color: #fff; border: none; border-radius: 14px;
+  padding: .55rem 1.4rem; font-weight: 700; box-shadow: 0 6px 16px rgba(224,135,107,.35);
+  transition: transform .12s ease, background .12s ease;
 }
-
-/* 메인 컨텐츠를 "일기장 페이지" 카드로 */
-[data-testid="stMainBlockContainer"] {
-  max-width: 46rem;
-  margin: 1.5rem auto 3rem auto;
-  background: var(--diary-bg-card);
-  border-radius: 1.75rem;
-  padding: 2.5rem clamp(1.25rem, 5vw, 3rem) 3rem clamp(1.25rem, 5vw, 3rem);
-  box-shadow: 0 18px 40px rgba(74, 52, 40, 0.14), 0 2px 8px rgba(74, 52, 40, 0.08);
+div.stButton > button:hover { background: var(--accent-strong); transform: translateY(-1px); }
+.card {
+  background: #fffdf9; border-radius: 18px; padding: 1.15rem 1.25rem; margin: .7rem 0;
+  border: 1px solid #f2ebe0; box-shadow: 0 8px 22px rgba(160,120,90,.08);
+  border-left: 6px solid var(--stripe, #ece3d6);
 }
-
-/* 다이어리 헤더 */
-.diary-header {
-  text-align: center;
-  padding-bottom: 1rem;
-  margin-bottom: 1.5rem;
-  border-bottom: 2px dashed var(--diary-border);
+.badge {
+  display: inline-block; padding: .22rem .7rem; border-radius: 999px;
+  font-weight: 700; font-size: .9rem; margin-bottom: .55rem;
 }
-.diary-header__eyebrow {
-  font-family: "Gaegu", sans-serif;
-  color: var(--diary-accent-deep);
-  font-size: 1.05rem;
-  margin: 0 0 0.15rem 0;
-  letter-spacing: 0.04em;
-}
-.diary-header__title {
-  font-family: "Gaegu", sans-serif;
-  color: var(--diary-text-main);
-  font-size: 2.2rem;
-  font-weight: 700;
-  margin: 0;
-}
-.diary-header__date {
-  color: var(--diary-text-sub);
-  font-size: 0.95rem;
-  margin: 0.35rem 0 0 0;
-}
-
-.diary-lead {
-  color: var(--diary-text-sub);
-  text-align: center;
-  margin-bottom: 1.5rem;
-  line-height: 1.6;
-}
-
-/* 한 줄 입력: 노트 라인 느낌 */
-[data-testid="stTextInput"] label p {
-  font-family: "Gaegu", sans-serif;
-  color: var(--diary-text-main);
-  font-size: 1.05rem;
-}
-[data-testid="stTextInput"] input {
-  font-size: 1.05rem;
-  color: var(--diary-text-main);
-}
-[data-testid="stTextInput"] input::placeholder {
-  color: var(--diary-text-sub);
-  opacity: 0.75;
-}
-
-/* 버튼: 둥근 코랄 알약 버튼 */
-[data-testid="stBaseButton-secondary"] {
-  color: var(--diary-accent-deep);
-  border-color: var(--diary-accent-deep);
-}
-
-/* 포커스 표시(키보드 접근성): 색상만이 아니라 뚜렷한 윤곽선으로 항상 보이게 */
-button:focus-visible,
-input:focus-visible,
-[data-testid="stTextInput"] input:focus {
-  outline: 3px solid var(--diary-accent-deep) !important;
-  outline-offset: 2px;
-}
-
-/* 알림(성공/에러) 카드: 모서리를 둥글게, 폰트를 통일 */
-[data-testid="stAlertContainer"] {
-  border-radius: 1rem;
-  animation: diaryFadeInUp 0.5s ease both;
-}
-
-/* 결과 영역 소제목 */
-.diary-section-title {
-  font-family: "Gaegu", sans-serif;
-  color: var(--diary-text-main);
-  font-size: 1.4rem;
-  font-weight: 700;
-  margin: 1.75rem 0 0.75rem 0;
-}
-
-/* 포스트잇처럼 보이는 AI 답장 카드 */
-.postit-card {
-  position: relative;
-  background: var(--diary-bg-postit);
-  border-radius: 0.25rem 1.1rem 1.1rem 1.1rem;
-  padding: 1.35rem 1.6rem;
-  margin-top: 0.75rem;
-  box-shadow: 4px 8px 18px rgba(74, 52, 40, 0.18);
-  transform: rotate(-1deg);
-  animation: diaryFadeInUp 0.6s ease both;
-}
-.postit-card::before {
-  content: "";
-  position: absolute;
-  top: -12px;
-  left: 1.75rem;
-  width: 3.2rem;
-  height: 1.35rem;
-  background: rgba(242, 164, 136, 0.65);
-  border-radius: 2px;
-  transform: rotate(-5deg);
-}
-.postit-card__eyebrow {
-  font-family: "Gaegu", sans-serif;
-  color: var(--diary-accent-deep);
-  font-size: 1rem;
-  margin: 0 0 0.4rem 0;
-}
-.postit-card__feedback {
-  color: var(--diary-text-main);
-  font-size: 1.05rem;
-  line-height: 1.65;
-  margin: 0.35rem 0 0 0;
-}
-
-/* 감정 라벨 태그 */
-.emotion-badge {
-  display: inline-block;
-  background: var(--diary-bg-badge);
-  color: var(--diary-badge-text);
-  border-radius: 999px;
-  padding: 0.2rem 0.85rem;
-  font-size: 0.85rem;
-  font-weight: 700;
-}
-
-/* 최근 기록: 지나간 다이어리 페이지 느낌의 아코디언 */
-[data-testid="stExpander"] {
-  background: var(--diary-bg-card);
-  border: 1px solid var(--diary-border);
-  border-radius: 1rem;
-  margin-bottom: 0.6rem;
-  box-shadow: 0 4px 10px rgba(74, 52, 40, 0.06);
-}
-.diary-entry-body p {
-  margin: 0.2rem 0;
-  color: var(--diary-text-main);
-}
-.diary-entry-body .label {
-  color: var(--diary-text-sub);
-  font-weight: 700;
-  margin-right: 0.3rem;
-}
-
-@keyframes diaryFadeInUp {
-  from { opacity: 0; transform: translateY(10px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-.postit-card { animation-name: diaryFadeInUp; }
-.postit-card:not(:hover) { transform: rotate(-1deg); }
-
-/* 사용자의 모션 감소 설정을 존중한다 */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
-    animation-duration: 0.001ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.001ms !important;
-    scroll-behavior: auto !important;
-  }
-}
+.card .orig { color: var(--text); font-size: 1.05rem; margin: .1rem 0 .7rem; line-height: 1.55; }
+.card .orig::before { content: "“"; color: var(--muted); }
+.card .orig::after { content: "”"; color: var(--muted); }
+.card .empathy-label { color: var(--accent-strong); font-weight: 700; font-size: .86rem; margin-bottom: .2rem; }
+.card .empathy { color: #57514a; line-height: 1.65; }
+.card .date { color: var(--muted); font-size: .8rem; margin-top: .1rem; }
+.card .notice { color: #a06a4a; font-size: .82rem; margin-top: .5rem; }
+.empty { text-align:center; color: var(--muted); padding: 2.4rem 1rem;
+  border: 1.5px dashed #e3d8c8; border-radius: 18px; background: rgba(255,253,249,.5); }
 </style>
 """
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-st.markdown(_DIARY_CSS, unsafe_allow_html=True)
-
-# ---------------------------------------------------------------------------
-# 다이어리 헤더 (오늘 날짜를 다이어리 헤더처럼 표시)
-# ---------------------------------------------------------------------------
-st.markdown(
-    f"""
-    <div class="diary-header">
-        <p class="diary-header__eyebrow">오늘의 다이어리</p>
-        <h1 class="diary-header__title">감성 다이어리</h1>
-        <p class="diary-header__date">{html.escape(_today_header_text())}</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown(
-    '<p class="diary-lead">오늘 있었던 일을, 짧게 한 줄로 적어보세요.<br/>제가 가만히 들어볼게요.</p>',
-    unsafe_allow_html=True,
-)
-
-# C2: 입력 초기화를 위해 text_input을 session_state 키에 바인딩한다.
-if "diary_input" not in st.session_state:
-    st.session_state["diary_input"] = ""
-
-# 중복 제출 방지: 입력값을 바꾸지 않은 채 같은 내용을 다시 제출(빠른 연속 클릭 등)하면
-# AI를 다시 호출하거나 DB에 중복 저장하지 않고, 직전 결과를 그대로 재사용한다.
-# (OpenAI 응답 지연 때문에 시간 기반 디바운스는 신뢰할 수 없어, 직전에 "처리 완료된
-# 내용"과의 일치 여부로만 판단한다. 입력을 바꾸거나 초기화한 뒤 다시 제출하면 정상 처리된다.)
-if "_last_submission" not in st.session_state:
-    st.session_state["_last_submission"] = None
+# ---- 세션 상태 ----
+# Streamlit Cloud는 파일시스템이 임시(재시작 시 초기화)라 히스토리는 세션 메모리에 보관한다.
+if "history" not in st.session_state:
+    st.session_state.history = []
+if "next_id" not in st.session_state:
+    st.session_state.next_id = 1
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
 
 
-def _clear_input():
-    st.session_state["diary_input"] = ""
+def emotion_badge_html(emotion: str) -> str:
+    emoji, bg, fg = EMOTION_STYLE.get(emotion, EMOTION_STYLE["기타"])
+    return f'<span class="badge" style="background:{bg};color:{fg}">{emoji} {html.escape(emotion)}</span>'
 
 
-# M1: 한 줄 입력창 (단일 라인 - st.text_input)
-diary_input = st.text_input(
-    "오늘의 한 줄",
-    key="diary_input",
-    placeholder="예: 오늘은 유독 힘든 하루였어요",
-)
-
-col_submit, col_clear = st.columns([1, 1])
-with col_submit:
-    submitted = st.button("제출", type="primary", width="stretch")
-with col_clear:
-    st.button(
-        "입력 초기화",
-        on_click=_clear_input,
-        type="secondary",
-        width="stretch",
+def card_html(entry: dict, show_date: bool = True) -> str:
+    _, _, fg = EMOTION_STYLE.get(entry["emotion"], EMOTION_STYLE["기타"])
+    date_html = (
+        f'<div class="date">{html.escape(entry["created_at"])}</div>' if show_date else ""
+    )
+    notice_html = (
+        f'<div class="notice">ℹ️ {html.escape(entry["notice"])}</div>'
+        if entry.get("notice")
+        else ""
+    )
+    # 사용자 원문·AI 응답은 반드시 escape 하여 HTML 주입(XSS)을 막는다.
+    return (
+        f'<div class="card" style="--stripe:{fg}">'
+        f"{emotion_badge_html(entry['emotion'])}"
+        f'<div class="orig">{html.escape(entry["content"])}</div>'
+        f'<div class="empathy-label">💌 마음을 담은 한마디</div>'
+        f'<div class="empathy">{html.escape(entry["empathy"])}</div>'
+        f"{notice_html}{date_html}"
+        f"</div>"
     )
 
-# 결과 표시 영역
-st.markdown('<p class="diary-section-title">오늘의 답장</p>', unsafe_allow_html=True)
+
+# ---- 헤더 ----
+st.markdown('<div class="diary-title">🌿 AI 공감 다이어리</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="diary-sub">오늘 있었던 일을 한 줄로 남겨보세요. 마음을 읽어드릴게요.</div>',
+    unsafe_allow_html=True,
+)
+
+# 키 미설정 안내(값은 노출하지 않음)
+if not get_api_key():
+    st.warning(
+        "OpenAI API 키가 설정되지 않았어요. 로컬은 `.streamlit/secrets.toml` 또는 `.env`, "
+        "배포는 Streamlit Cloud의 **Secrets**에 `OPENAI_API_KEY`를 넣어주세요. "
+        "지금은 기본 위로 메시지로 동작합니다."
+    )
+
+# ---- 작성 폼 ----
+with st.form("entry_form", clear_on_submit=True):
+    content = st.text_area(
+        "오늘 하루, 한 줄로 남긴다면?",
+        max_chars=300,
+        height=90,
+        placeholder="예) 오랜만에 친구를 만나서 마음이 따뜻해졌다.",
+    )
+    submitted = st.form_submit_button("기록하기")
+
 if submitted:
-    stripped_input = diary_input.strip()
-    # M1: 빈 문자열(공백만 있는 경우 포함) 제출은 막고 AI 호출로 넘어가지 않는다.
-    if not stripped_input:
-        st.error("오늘 있었던 일을 한 줄로 적어주시겠어요?")
+    text = (content or "").strip()
+    if not text:
+        st.error("한 줄이라도 적어 주세요.")
     else:
-        last = st.session_state["_last_submission"]
-        is_duplicate = last is not None and last["content"] == stripped_input
+        with st.spinner("마음을 읽는 중..."):
+            result = analyze_entry(text)
+        entry = {
+            "id": st.session_state.next_id,
+            "content": text,
+            "emotion": result["emotion"],
+            "empathy": result["empathy"],
+            "notice": result.get("notice"),
+            "created_at": datetime.now().strftime("%Y.%m.%d %H:%M"),
+        }
+        st.session_state.next_id += 1
+        st.session_state.history.insert(0, entry)  # 최신순
+        st.session_state.last_result = entry
 
-        if is_duplicate:
-            # 빠른 연속 클릭 등으로 동일 내용이 다시 제출된 경우: AI 재호출/중복 저장 없이
-            # 방금 받은 결과를 그대로 다시 보여준다.
-            result = last["result"]
-        else:
-            # M3: 로딩 상태 표시 (톤에 맞는 문구)
-            with st.spinner("오늘 하루를 가만히 들여다보는 중이에요..."):
-                try:
-                    result = ai_chain.get_ai_feedback(diary_input)
-                except Exception:
-                    # M3: 실패 시 사용자 친화적 에러 메시지, 앱은 죽지 않음
-                    st.error("지금은 마음을 전하기 어려워요. 잠시 후 다시 시도해주세요.")
-                    result = None
-                else:
-                    # S1: AI 피드백 생성 성공 시 로컬 저장
-                    now = datetime.now()
-                    db.insert_entry(
-                        date=now.strftime("%Y-%m-%d"),
-                        content=diary_input,
-                        emotion_summary=result.get("emotion_summary", ""),
-                        ai_feedback=result.get("ai_feedback", ""),
-                        created_at=now.isoformat(),
-                        emotion_label=result.get("emotion_label", ""),
-                    )
-                    st.session_state["_last_submission"] = {
-                        "content": stripped_input,
-                        "result": result,
-                    }
+# ---- 최근 결과 ----
+if st.session_state.last_result is not None:
+    st.markdown("#### 오늘의 공감")
+    st.markdown(card_html(st.session_state.last_result, show_date=False), unsafe_allow_html=True)
 
-        if result is not None:
-            # M3: 성공 시 감정 요약 + 공감 메시지 표시
-            emotion_label = result.get("emotion_label", "")
-            emotion_summary = result.get("emotion_summary", "")
-            ai_feedback = result.get("ai_feedback", "")
+# ---- 히스토리 ----
+st.markdown("---")
+st.markdown("### 📖 지난 기록")
 
-            if emotion_label:
-                # C1: 감정 라벨 태그 표시
-                st.success(f"오늘의 감정: {emotion_label} · {emotion_summary}")
-            else:
-                st.success(emotion_summary or "당신의 하루를 잘 들었어요.")
-
-            # 포스트잇/편지 카드 느낌의 AI 피드백
-            st.markdown(
-                f"""
-                <div class="postit-card">
-                    <p class="postit-card__eyebrow">당신에게 보내는 답장</p>
-                    <p class="postit-card__feedback">{html.escape(ai_feedback)}</p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-else:
+if not st.session_state.history:
     st.markdown(
-        '<p class="diary-lead">아직 오늘의 이야기를 듣지 못했어요. 위에 한 줄을 적어보세요.</p>',
-        unsafe_allow_html=True,
-    )
-
-# 최근 기록 표시 영역 (S2) — 지나간 일기장을 넘겨보는 듯한 아코디언 목록
-st.markdown('<p class="diary-section-title">지나간 하루들</p>', unsafe_allow_html=True)
-recent_entries = db.get_recent_entries(limit=5)
-if not recent_entries:
-    st.markdown(
-        '<p class="diary-lead">아직 넘겨볼 페이지가 없어요.</p>',
+        '<div class="empty">아직 남긴 일기가 없어요.<br>첫 한 줄을 기록해보는 건 어때요?</div>',
         unsafe_allow_html=True,
     )
 else:
-    for entry in recent_entries:
-        label = entry.get("emotion_label")
-        tag = f" · {label}" if label else ""
-        expander_title = f"{entry['date']}{tag} — {entry['content']}"
-        with st.expander(expander_title):
-            body_parts = ['<div class="diary-entry-body">']
-            if label:
-                body_parts.append(
-                    f'<span class="emotion-badge">{html.escape(label)}</span>'
-                )
-            if entry.get("emotion_summary"):
-                body_parts.append(
-                    '<p><span class="label">감정 요약</span>'
-                    f"{html.escape(entry['emotion_summary'])}</p>"
-                )
-            if entry.get("ai_feedback"):
-                body_parts.append(
-                    '<p><span class="label">AI 피드백</span>'
-                    f"{html.escape(entry['ai_feedback'])}</p>"
-                )
-            body_parts.append("</div>")
-            st.markdown("".join(body_parts), unsafe_allow_html=True)
+    for entry in st.session_state.history:
+        st.markdown(card_html(entry), unsafe_allow_html=True)
+        if st.button("🗑️ 삭제", key=f"del-{entry['id']}"):
+            st.session_state.history = [
+                e for e in st.session_state.history if e["id"] != entry["id"]
+            ]
+            if (
+                st.session_state.last_result
+                and st.session_state.last_result["id"] == entry["id"]
+            ):
+                st.session_state.last_result = None
+            st.rerun()
+
+st.caption("💡 배포 환경(Streamlit Cloud)에서는 앱이 재시작되면 기록이 초기화됩니다.")
